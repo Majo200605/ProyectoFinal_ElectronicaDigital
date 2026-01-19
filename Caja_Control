@@ -1,0 +1,487 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+//pines del display
+const int dataPin = 2;
+const int latchPin = 5;
+const int clockPin = 4;
+const int sensor = 21;  //infrarrojo
+//pulsadores
+const int BTN1 = 26;
+const int BTN2 = 14;
+const int BTN3 = 12;
+const int emergencia = 19;
+const int switch_dia = 15;
+//leds
+const int led_verde = 18;
+const int led_rojo = 0;
+byte paso = 0;     //para cambiar paso del motor a pasos
+int modo = 0;      //definir el modo de conteo
+int contador = 0;  //cuenta de productos, no es pin
+int contadorPrevio = -1;
+volatile unsigned long tband = 0;  //variable para evitar delays para el movimiento del motor
+volatile bool emergenciaActiva = false;
+volatile bool emergenciaEnCurso = false;
+// variables para controlar el display
+const byte ARRAY_SIZE = 27;
+byte segment_codes[ARRAY_SIZE];
+String available_chars[ARRAY_SIZE];
+int findIndexOfChar(String character);
+volatile bool obstaculoDetectado = false;  //bandera de la funcion sensorISR()
+volatile unsigned long tLast = 0;          //toma el ti    empo para el antirrebote en sensorISR()
+volatile bool movimiento = true;           //suelta la bandera para controlar el movimiento o detencion del motor
+//pines del motor
+const int in1 = 33;
+const int in2 = 32;
+const int in3 = 25;
+const int in4 = 27;
+const int speed = 3;  //define la velocidad del motor, haciendo delays mas cortos o largos entre paso
+//funciones
+void show(String value);
+void sensorIR();                 //suma valores en el contador
+void IRAM_ATTR sensorISR();      //suelta la bandera para contar
+void banda_activa();             //hace girar al motor
+void valores_display();          //lista de valores predeterminados del display
+bool modos();                    //definir modos para los pines de los botones
+void IRAM_ATTR isrEmergencia();  //Interrupción de emergencia
+void salirEmergencia();
+void enviarDatos();  //envia datos a la esp servidor
+                     //funcion que sale de la emergencia
+//pasos del motor
+void step1();
+void step2();
+void step3();
+void step4();
+//variables relevantes
+// Producción y lotes
+int produccion_total = 0;
+int lotes_completados = 0;  //lotes que no fueron interrumpidos en emergencia
+// tiempo de produccion
+unsigned long t_inicio_jornada = 0;
+unsigned long t_fin_jornada = 0;
+// Emergencias
+int emergencias_count = 0;
+unsigned long t_emergencia_inicio = 0;
+unsigned long t_emergencia_total = 0;
+// Tiempo operativo
+unsigned long tiempo_operativo = 0;
+// Objetivo diario
+int objetivo_diario = 0;  // recibido del Maestro
+float cumplimiento = 0.0;
+bool lote_en_curso = false;  //bandera cuando hay un lote en curso
+bool jornadaFinalizada = false;
+
+//variables wifi
+const char* ssid = "NETLIFE-uioddalvaradoo1";
+const char* password = "0301001608";
+
+const char* serverIP = "192.168.100.198";  // ← Cambia por la IP real del receptor
+const int serverPort = 80;
+const int id_maquina = 2; // Es 1 o 2 según la la caja con la que se esté trabajando
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(sensor, INPUT);
+  pinMode(latchPin, OUTPUT);
+  pinMode(clockPin, OUTPUT);
+  pinMode(dataPin, OUTPUT);
+  pinMode(BTN1, INPUT_PULLUP);
+  pinMode(BTN2, INPUT_PULLUP);
+  pinMode(BTN3, INPUT_PULLUP);
+  pinMode(switch_dia, INPUT_PULLUP);
+  pinMode(emergencia, INPUT_PULLUP);
+  pinMode(led_verde, OUTPUT);
+  pinMode(led_rojo, OUTPUT);
+  valores_display();
+  attachInterrupt(digitalPinToInterrupt(sensor), sensorISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(emergencia), isrEmergencia, FALLING);  //pines motor
+  pinMode(in1, OUTPUT);
+  pinMode(in2, OUTPUT);
+  pinMode(in3, OUTPUT);
+  pinMode(in4, OUTPUT);
+  show("    0000");
+
+  while (digitalRead(switch_dia) == HIGH) {  //espera a que el interruptor este activado para empezar
+    digitalWrite(led_verde, HIGH);
+    digitalWrite(led_rojo, LOW);
+    delay(200);
+    digitalWrite(led_verde, LOW);
+    digitalWrite(led_rojo, HIGH);
+    delay(200);
+  }
+
+  //inicializacion de datos
+  t_inicio_jornada = millis();
+  produccion_total = 0;
+  lotes_completados = 0;
+  emergencias_count = 0;
+  t_emergencia_total = 0;
+  cumplimiento = 0.0;
+
+  while (WiFi.status() != WL_CONNECTED) {
+    WiFi.begin(ssid, password);
+    for (int i = 0; i < 10 && WiFi.status() != WL_CONNECTED; i++) {
+      digitalWrite(led_rojo, HIGH);
+      delay(250);
+      digitalWrite(led_rojo, LOW);
+      delay(250);
+    }
+  }
+  /*Serial.println("✅ WiFi conectado");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());*/
+}
+
+void loop() {
+
+  while (!modos()) {
+    modos();
+    digitalWrite(led_verde, HIGH);
+  }
+  if (digitalRead(switch_dia) == HIGH && !jornadaFinalizada) {
+    jornadaFinalizada = true;
+    Serial.println("📤 Fin de jornada detectado. Enviando datos...");
+
+
+    movimiento = false;
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, LOW);
+    digitalWrite(in3, LOW);
+    digitalWrite(in4, LOW);
+    digitalWrite(led_verde, LOW);
+    digitalWrite(led_rojo, LOW);
+    show("        ");
+
+    // Calcular métricas
+    t_fin_jornada = millis();
+    tiempo_operativo = (t_fin_jornada - t_inicio_jornada) - t_emergencia_total;
+    if (objetivo_diario > 0) {
+      cumplimiento = (float)produccion_total / (float)objetivo_diario * 100.0;
+    }
+
+    // Enviar datos por HTTP
+    enviarDatos();
+    while (true)
+      ;
+  } else {
+    if (movimiento) { banda_activa(); }
+    if (emergenciaActiva) {
+      digitalWrite(led_rojo, HIGH);
+      digitalWrite(led_verde, LOW);
+    } else {
+      digitalWrite(led_rojo, LOW);
+    }
+
+    sensorIR();
+
+    if (movimiento) {
+      banda_activa();
+    }
+
+    modos();
+    //valida que la cuenta llega a algun limite para detener el motor
+    if (contador == 6 && modo == 1 || contador == 12 && modo == 2 || contador == 24 && modo == 3) {
+      movimiento = false;
+
+      if (!emergenciaActiva && lote_en_curso) {  //cuando se ha llegado al limite
+        lotes_completados++;
+        lote_en_curso = false;  // cerrar lote
+      }
+
+      if (emergenciaActiva == false) {
+        digitalWrite(led_verde, HIGH);
+      }
+    }
+
+    String s = String(contador);
+    while (s.length() < 4) s = "0" + s;  // 0000..0024
+    show("    " + s);
+
+    if (contador != contadorPrevio) {
+      
+      contadorPrevio = contador;
+    }
+  }
+}
+
+
+//Funciones
+void show(String value) {
+  int skip = 0;
+  for (int i = 0; i < value.length(); i++) {
+    if (!((String)value[i]).equals(".")) {
+      int indexOfCharToWrite = findIndexOfChar((String)value[i]);
+      if (indexOfCharToWrite > -1) {
+        byte bitToWrite = 0;
+        digitalWrite(latchPin, LOW);
+        byte code = segment_codes[indexOfCharToWrite];
+
+        bool skipNext = false;
+        if (i + 1 < value.length() && ((String)value[i + 1]).equals(".")) {
+          bitWrite(code, 7, 0);
+          skipNext = true;
+        }
+
+        shiftOut(dataPin, clockPin, MSBFIRST, code);
+        bitWrite(bitToWrite, i - skip, 1);
+        shiftOut(dataPin, clockPin, LSBFIRST, bitToWrite);
+        digitalWrite(latchPin, HIGH);
+
+        if (skipNext) skip++;
+      }
+    }
+  }
+}
+
+int findIndexOfChar(String character) {
+  for (int i = 0; i < ARRAY_SIZE; i++) {
+    if (character.equals(available_chars[i])) return i;
+  }
+  return -1;
+}
+
+// ISR: botón emergencia (cambia estado ON/OFF)
+void IRAM_ATTR isrEmergencia() {
+  digitalWrite(in1, LOW);  //primero se detiene
+  digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW);
+  digitalWrite(in4, LOW);
+  movimiento = false;  //deja de girar en el loop
+
+  // Solo si no había una emergencia en curso, iniciar conteo
+  if (!emergenciaEnCurso) {
+    emergenciaEnCurso = true;
+    emergenciaActiva = true;         //bandera para el loop
+    t_emergencia_inicio = millis();  // marcar inicio del paro
+  }
+}
+
+void sensorIR() {
+  if (obstaculoDetectado) {
+    if (movimiento && !emergenciaActiva) {
+      contador++;
+      produccion_total++;  //  Solo suma si la banda está activa y sin emergencia
+    }
+    obstaculoDetectado = false;
+  }
+}
+
+void IRAM_ATTR sensorISR() {
+  unsigned long t = millis();
+  if (t - tLast > 500) {        // 0.5s anti-rebote
+    obstaculoDetectado = true;  //bandera
+    tLast = t;
+  }
+}
+
+void step1() {
+  digitalWrite(in1, HIGH);
+  digitalWrite(in2, HIGH);
+  digitalWrite(in3, LOW);
+  digitalWrite(in4, LOW);
+}
+void step2() {
+  digitalWrite(in1, LOW);
+  digitalWrite(in2, HIGH);
+  digitalWrite(in3, HIGH);
+  digitalWrite(in4, LOW);
+}
+void step3() {
+  digitalWrite(in1, LOW);
+  digitalWrite(in2, LOW);
+  digitalWrite(in3, HIGH);
+  digitalWrite(in4, HIGH);
+}
+void step4() {
+  digitalWrite(in1, HIGH);
+  digitalWrite(in2, LOW);
+  digitalWrite(in3, LOW);
+  digitalWrite(in4, HIGH);
+}
+
+void banda_activa() {
+  unsigned long t = millis();
+
+  if (t - tband >= speed) {
+    tband = t;
+
+    switch (paso) {
+      case 0:
+        step1();
+        break;
+      case 1:
+        step2();
+        break;
+      case 2:
+        step3();
+        break;
+      case 3:
+        step4();
+        break;
+    }
+    paso++;
+    if (paso > 3) paso = 0;  // vuelve a step1
+  }
+}
+
+void valores_display() {
+  available_chars[0] = "0";
+  available_chars[1] = "1";
+  available_chars[2] = "2";
+  available_chars[3] = "3";
+  available_chars[4] = "4";
+  available_chars[5] = "5";
+  available_chars[6] = "6";
+  available_chars[7] = "7";
+  available_chars[8] = "8";
+  available_chars[9] = "9";
+  available_chars[10] = "A";
+  available_chars[11] = "b";
+  available_chars[12] = "D";
+  available_chars[13] = "c";
+  available_chars[14] = "d";
+  available_chars[15] = "E";
+  available_chars[16] = "F";
+  available_chars[17] = "H";
+  available_chars[18] = "h";
+  available_chars[19] = "L";
+  available_chars[20] = "n";
+  available_chars[21] = "I";
+  available_chars[22] = "O";
+  available_chars[23] = "o";
+  available_chars[24] = "P";
+  available_chars[25] = "S";
+  available_chars[26] = " ";
+
+  segment_codes[0] = 0b11000000;
+  segment_codes[1] = 0b11111001;
+  segment_codes[2] = 0b10100100;
+  segment_codes[3] = 0b10110000;
+  segment_codes[4] = 0b10011001;
+  segment_codes[5] = 0b10010010;
+  segment_codes[6] = 0b10000011;
+  segment_codes[7] = 0b11111000;
+  segment_codes[8] = 0b10000000;
+  segment_codes[9] = 0b10011000;
+  segment_codes[10] = 0b10001000;
+  segment_codes[11] = 0b10000011;
+  segment_codes[12] = 0b11000110;
+  segment_codes[13] = 0b10100111;
+  segment_codes[14] = 0b10100001;
+  segment_codes[15] = 0b10000110;
+  segment_codes[16] = 0b10001110;
+  segment_codes[17] = 0b10001001;
+  segment_codes[18] = 0b10001011;
+  segment_codes[19] = 0b11000111;
+  segment_codes[20] = 0b10101011;
+  segment_codes[21] = 0b11111001;
+  segment_codes[22] = 0b11000000;
+  segment_codes[23] = 0b10100011;
+  segment_codes[24] = 0b10001100;
+  segment_codes[25] = 0b10010010;
+  segment_codes[26] = 0b11111111;
+}
+
+bool modos() {
+  // detectar "click" (flanco) para que no resetee mil veces
+  static bool last1 = HIGH, last2 = HIGH, last3 = HIGH;
+  bool b1 = digitalRead(BTN1);
+  bool b2 = digitalRead(BTN2);
+  bool b3 = digitalRead(BTN3);
+
+  if (last1 == HIGH && b1 == LOW) {
+    modo = 1;
+    contador = 0;
+    movimiento = true;
+    digitalWrite(led_verde, LOW);
+    emergenciaActiva = false;
+    lote_en_curso = true;
+    salirEmergencia();
+  }
+  if (last2 == HIGH && b2 == LOW) {
+    modo = 2;
+    contador = 0;
+    movimiento = true;
+    digitalWrite(led_verde, LOW);
+    emergenciaActiva = false;
+    lote_en_curso = true;
+    salirEmergencia();
+  }
+  if (last3 == HIGH && b3 == LOW) {
+    modo = 3;
+    contador = 0;
+    movimiento = true;
+    digitalWrite(led_verde, LOW);
+    emergenciaActiva = false;
+    lote_en_curso = true;
+    salirEmergencia();
+  }
+
+  last1 = b1;
+  last2 = b2;
+  last3 = b3;
+
+  // límites por modo
+  if (modo == 1 && contador > 6) {
+    contador = 6;
+  }
+  if (modo == 2 && contador > 12) {
+    contador = 12;
+  }
+  if (modo == 3 && contador > 24) {
+    contador = 24;
+  }
+  if (modo == 0) {
+    return false;
+  } else {
+    return true;
+  }
+}
+
+void salirEmergencia() {
+  if (emergenciaEnCurso) {
+    emergenciaActiva = false;
+    emergenciaEnCurso = false;
+
+    //cuenta la emergencia
+    emergencias_count++;
+    //se envia en emergencia
+
+    // Acumula el tiempo de paro
+    t_emergencia_total += millis() - t_emergencia_inicio;
+
+    // Señalización visual
+    digitalWrite(led_rojo, LOW);
+    digitalWrite(led_verde, LOW);
+  }
+}
+
+void enviarDatos() {
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    String url = "http://" + String(serverIP) + ":" + String(serverPort);
+
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+
+    // Construir JSON con datos reales
+    String json = "{";
+    json += "\"id_maquina\":" + String(id_maquina) + ",";
+    json += "\"produccion_total\":" + String(produccion_total) + ",";
+    json += "\"lotes_completados\":" + String(lotes_completados) + ",";
+    json += "\"emergencias\":" + String(emergencias_count) + ",";
+    json += "\"tiempo_operativo\":" + String(tiempo_operativo) + ",";
+    json += "\"cumplimiento\":" + String(cumplimiento, 1);
+    json += "}";
+
+    int httpResponseCode = http.POST(json);
+
+    Serial.print("📡 Respuesta HTTP: ");
+    Serial.println(httpResponseCode);
+
+    http.end();
+  } else {
+    Serial.println("❌ WiFi no conectado");
+  }
+}
