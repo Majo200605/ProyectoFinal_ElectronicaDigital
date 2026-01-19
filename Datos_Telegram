@@ -1,0 +1,202 @@
+#include <WiFi.h>
+#include <ArduinoJson.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+
+const char* ssid = "NETLIFE-uioddalvaradoo1";
+const char* password = "0301001608";
+
+#define BOT_TOKEN "8484287016:AAHkSZLfEUTcO5f1AKr-vFu8rpFti_VPRl8"
+#define CHAT_ID "1631715392"
+
+WiFiServer server(80);
+WiFiClientSecure secured_client;
+UniversalTelegramBot bot(BOT_TOKEN, secured_client);
+
+// Estado de recepción
+bool recibidoESP1 = false;
+bool recibidoESP2 = false;
+
+// Variables de ESP1
+int unidades1 = 0, lotes1 = 0, emerg1 = 0;
+unsigned long tiempo1 = 0;
+float cumpl1 = 0.0;
+
+// Variables de ESP2
+int unidades2 = 0, lotes2 = 0, emerg2 = 0;
+unsigned long tiempo2 = 0;
+float cumpl2 = 0.0;
+
+// Objetivo diario (configurable)
+int objetivo_diario = 0;
+
+void setup() {
+  Serial.begin(9600);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\n✅ WiFi conectado");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+
+  secured_client.setInsecure();
+  server.begin();
+  Serial.println("🚀 Servidor HTTP iniciado");
+}
+
+void loop() {
+  // Comandos por consola
+  if (Serial.available()) {
+    String entrada = Serial.readStringUntil('\n');
+    entrada.trim();
+
+    if (entrada.startsWith("objetivo:")) {
+      objetivo_diario = entrada.substring(9).toInt();
+      Serial.print("🎯 Objetivo diario actualizado a: ");
+      Serial.println(objetivo_diario);
+    } else if (entrada == "r") {
+      mostrarEstado();
+    }
+  }
+
+  WiFiClient client = server.available();
+  if (!client) return;
+
+  int contentLength = 0;
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r") break;
+    if (line.startsWith("Content-Length:")) {
+      contentLength = line.substring(15).toInt();
+    }
+  }
+
+  String body = "";
+  unsigned long timeout = millis();
+  while (body.length() < contentLength && millis() - timeout < 3000) {
+    if (client.available()) {
+      body += (char)client.read();
+    }
+  }
+
+  DynamicJsonDocument doc(1024);
+  DeserializationError error = deserializeJson(doc, body);
+
+  if (error) {
+    Serial.println("❌ Error al parsear JSON");
+  } else {
+    int id = doc["id_maquina"] | 0;
+    int unidades = doc["produccion_total"] | 0;
+    int lotes = doc["lotes_completados"] | 0;
+    int emergencias = doc["emergencias"] | 0;
+    unsigned long tiempo = doc["tiempo_operativo"] | 0;
+    float cumplimiento = doc["cumplimiento"] | 0.0;
+
+    Serial.printf("📄 Datos de ESP %d:\n", id);
+    Serial.printf("Unidades: %d\nLotes: %d\nEmergencias: %d\nTiempo: %lu\nCumplimiento: %.2f\n\n",
+                  unidades, lotes, emergencias, tiempo, cumplimiento);
+
+    if (id == 1) {
+      unidades1 = unidades;
+      lotes1 = lotes;
+      emerg1 = emergencias;
+      tiempo1 = tiempo;
+      cumpl1 = cumplimiento;
+      recibidoESP1 = true;
+    } else if (id == 2) {
+      unidades2 = unidades;
+      lotes2 = lotes;
+      emerg2 = emergencias;
+      tiempo2 = tiempo;
+      cumpl2 = cumplimiento;
+      recibidoESP2 = true;
+    }
+
+    // Enviar datos individuales a Telegram
+    String mensaje_individual = "📄 Datos de ESP " + String(id) + "\n";
+    mensaje_individual += "Unidades: " + String(unidades) + "\n";
+    mensaje_individual += "Lotes: " + String(lotes) + "\n";
+    mensaje_individual += "Emergencias: " + String(emergencias) + "\n";
+    mensaje_individual += "Tiempo: " + String(tiempo) + "\n";
+    mensaje_individual += "Cumplimiento: " + String(cumplimiento, 2);
+    bot.sendMessage(CHAT_ID, mensaje_individual, "");
+
+    // Si ya llegaron los dos
+    if (recibidoESP1 && recibidoESP2) {
+      int totalUnidades = unidades1 + unidades2;
+      int totalLotes = lotes1 + lotes2;
+      int totalEmerg = emerg1 + emerg2;
+      unsigned long totalTiempo = tiempo1 + tiempo2;
+      float promedioCumpl = (cumpl1 + cumpl2) / 2.0;
+
+      int faltantes = objetivo_diario - totalUnidades;
+      float porcentajeFaltante = (objetivo_diario > 0 && faltantes > 0)
+        ? (faltantes * 100.0 / objetivo_diario)
+        : 0.0;
+
+      Serial.println("📊 DATOS COMBINADOS:");
+      Serial.printf("Unidades: %d\nLotes: %d\nEmergencias: %d\nTiempo: %lu\nCumplimiento: %.2f\n",
+                    totalUnidades, totalLotes, totalEmerg, totalTiempo, promedioCumpl);
+      if (objetivo_diario == 0) {
+        Serial.println("⚠️ Objetivo diario no definido. Usa: objetivo:XXX\n");
+      } else if (faltantes > 0) {
+        Serial.printf("❌ Objetivo NO cumplido. Faltaron %d unidades (%.2f%%)\n\n",
+                      faltantes, porcentajeFaltante);
+      } else {
+        Serial.println("✅ Objetivo diario CUMPLIDO\n");
+      }
+
+      String mensaje = "📊 Reporte Producción (ESP1 + ESP2)\n";
+      mensaje += "Unidades: " + String(totalUnidades) + "\n";
+      mensaje += "Lotes: " + String(totalLotes) + "\n";
+      mensaje += "Emergencias: " + String(totalEmerg) + "\n";
+      mensaje += "Tiempo: " + String(totalTiempo) + "\n";
+      mensaje += "Cumplimiento: " + String(promedioCumpl, 2) + "\n";
+
+      if (objetivo_diario == 0) {
+        mensaje += "⚠️ Objetivo diario no definido.";
+      } else if (faltantes > 0) {
+        mensaje += "❌ Objetivo NO cumplido\n";
+        mensaje += "Faltaron: " + String(faltantes) + " unidades (" + String(porcentajeFaltante, 2) + "%)";
+      } else {
+        mensaje += "✅ Objetivo diario CUMPLIDO";
+      }
+
+      bot.sendMessage(CHAT_ID, mensaje, "");
+      Serial.println("✅ Mensaje combinado enviado a Telegram");
+
+      recibidoESP1 = false;
+      recibidoESP2 = false;
+    }
+  }
+
+  client.println("HTTP/1.1 200 OK");
+  client.println("Content-Type: text/plain");
+  client.println("Connection: close");
+  client.println();
+  client.println("OK");
+
+  client.stop();
+  Serial.println("🔌 Cliente desconectado");
+}
+
+void mostrarEstado() {
+  int totalUnidades = unidades1 + unidades2;
+  int faltantes = objetivo_diario - totalUnidades;
+  float porcentajeFaltante = (objetivo_diario > 0 && faltantes > 0)
+    ? (faltantes * 100.0 / objetivo_diario)
+    : 0.0;
+
+  Serial.println("📋 Estado actual:");
+  Serial.printf("Unidades totales: %d\n", totalUnidades);
+  Serial.printf("Objetivo diario: %d\n", objetivo_diario);
+  if (objetivo_diario == 0) {
+    Serial.println("⚠️ Objetivo diario no definido. Usa: objetivo:XXX");
+  } else if (faltantes > 0) {
+    Serial.printf("Faltan: %d unidades (%.2f%%)\n", faltantes, porcentajeFaltante);
+  } else {
+    Serial.println("✅ Objetivo ya cumplido");
+  }
+}
